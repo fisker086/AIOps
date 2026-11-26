@@ -135,7 +135,7 @@ services:
     networks: [backend]
 
   app:
-    image: registry.cn-hangzhou.aliyuncs.com/my-aiops/zenith:latest
+    image: registry.cn-hangzhou.aliyuncs.com/my-aiops/zenith:v1
     restart: unless-stopped
     depends_on:
       postgres:
