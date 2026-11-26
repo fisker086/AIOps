@@ -1,25 +1,56 @@
-# AIOps 服务端 — Docker Compose
+# Zenith — 一条命令部署：一个 app 容器同时提供前端 SPA 和后端 API
 #
-# 适用场景：无本仓库源码、仅持本文件与 .env 即可部署（镜像从仓库拉取）。
-# 默认包含 PostgreSQL + pgvector；`docker compose up -d` 即可。
-# 若使用外部 Postgres，可在 .env 中设置 DATABASE_URL 覆盖默认连接串（仍会启动内置 postgres，高级场景可用 override 禁用）。
+# 快速开始（在本仓库根目录，无需先编辑 .env）：
+#   docker compose up -d
+#   docker compose logs app | grep admin_password   # 首次启动打印一次随机管理员密码
+#   open http://localhost:8080
+# 首次启动时 app 会在 ./docker/config/.env 生成配置（随机 JWT /
+# 管理员密码 / Vault 密钥），并把管理员密码打印一次。之后重启不会再打印，
+# 也不会轮换密钥。仓库里的开发用 .env 不参与容器内配置：本文件的内置服务地址
+# 与运行模式都是固定值，覆盖配置请改 /data/config/.env（应用以它为准）。
 #
-# OpenViking 知识库后端：默认不启动。需要时用 profile 启动：
-#   docker compose --profile openviking up -d
-# 同时设置 .env 中 OPENVIKING_ENABLED=true 以及 API key。
-# 使用外部 OpenViking 服务只需在 .env 中配置 OPENVIKING_URL 和 OPENVIKING_API_KEY，无需 profile。
+# 默认拉起：app + PostgreSQL(pgvector) + Redis + MinIO(+ 一次性建桶)。
+# 默认 AUTH_TYPE=password、LLM_GATEWAY_TYPE=none：不启动 LiteLLM，模型在
+# 「模型」页手填上游 Base URL / API Key。
 #
+# SSO / 虚拟 Key 场景：
+#   AUTH_TYPE=lark|feishu + LLM_GATEWAY_TYPE=litellm + docker compose --profile litellm up -d
+#   （Litellm 是可选 profile，默认不会启动，也不会成为 app 的 depends_on。）
+#
+# 知识库/向量记忆（OpenViking）按需启用：
+#   1) 编辑 deploy/openviking/ov.conf，填 embedding/vlm 的 api_key，
+#      并把 server.root_api_key 与配置里的 OPENVIKING_API_KEY 改成同一个随机值；
+#   2) 在配置里设置 OPENVIKING_ENABLED=true、KNOWLEDGE_PROVIDER=openviking
+#      （记忆可用 MEMORY_PROVIDER 留空走 OV）；
+#   3) docker compose --profile openviking up -d --build
+#
+# 外部依赖（不进 compose，在 /data/config/.env 配置即可）：
+#   - LLM 上游：OPENAI_API_KEY / ARK_* / ANTHROPIC_* 等外部 API；
+#   - CubeSandbox 代码沙箱：需宿主机 KVM 的独立部署（docs/cube-sandbox-部署与对接.md）。
+#     compose 默认 SANDBOX_TYPE=local（代码在 app 容器内以 uid 10001 执行，
+#     不要给 app 挂 docker.sock / 宿主机目录写权限）；有 Cube 时在配置里改
+#     SANDBOX_TYPE=cube + CUBE_API_URL / CUBE_TEMPLATE_ID 覆盖。
+#   - Langfuse / RAGFlow 等：可选外部服务，见 .env.example。
+#
+# 用外部 Postgres/Redis/S3 替代内置服务：在 /data/config/.env 写 DATABASE_URL /
+# REDIS_URL / OBJECT_STORE_* 覆盖即可（应用以该文件为准）；不想启动内置副本时
+# 再加一个 docker-compose.override.yml 把对应服务设为 profiles: ["disabled"]。
+# 内置数据库/缓存/对象存储默认不映射到宿主机：app 走 compose 内网，避免端口冲突。
+#
+# 仅用发布镜像、无源码部署：删除 app 的 build 段，并把 image 改为你的仓库地址后
+# `docker compose pull && docker compose up -d`。
+
 name: aiops
 
 services:
   postgres:
     image: pgvector/pgvector:pg17
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-aiops}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # 固定值：裸 compose 不读取仓库 .env，避免外部值把 app 的 DSN 带偏。
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: aiops
     volumes:
       - aiops-pg:/var/lib/postgresql/data
     healthcheck:
@@ -28,81 +59,153 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+    networks: [backend]
 
-  openviking:
-    profiles: ["openviking"]
-    image: ghcr.io/volcengine/openviking:latest
+  redis:
+    # 登录验证码 / OAuth state / IM 锁 / 调度去重 的共享状态；无它则退化为单机内存态。
+    image: redis:7-alpine
     restart: unless-stopped
-    ports:
-      - "${OPENVIKING_PORT:-1933}:1933"
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - ./deploy/openviking/ov.conf:/app/.openviking/ov.conf:ro
-      - openviking-data:/app/.openviking/data
-    environment:
-      OPENVIKING_WITH_BOT: "0"
+      - redis-data:/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://localhost:1933/health || exit 1"]
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  litellm:
+    # 可选网关：默认密码模式不需要；SSO + 虚拟 Key 时
+    # `docker compose --profile litellm up -d` 才会启动。
+    profiles: ["litellm"]
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-latest}
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    environment:
+      LITELLM_MASTER_KEY: ${LLM_GATEWAY_ADMIN_KEY:-${LITELLM_MASTER_KEY:-sk-zenith-admin-change-me}}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    volumes:
+      - ./deploy/litellm/config.yaml:/app/config.yaml:ro
+    ports:
+      - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2)"]
       interval: 10s
       timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [backend]
+
+  minio:
+    # S3 兼容对象存储：知识库原件 / 技能包 / 聊天生成文件。
+    # 官方镜像在 quay.io，很多网络拉不到；默认用可达的镜像，可用
+    # OBJECT_STORE_IMAGE 覆盖（例如 quay.io/minio/minio:latest）。
+    image: ${OBJECT_STORE_IMAGE:-pgsty/minio:latest}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: minio-change-me
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
       retries: 10
-      start_period: 15s
+      start_period: 10s
+    networks: [backend]
+
+  minio-init:
+    # 一次性建桶；app 等它成功退出后才启动，桶名与 app 的 OBJECT_STORE_BUCKET 一致。
+    image: registry.cn-hangzhou.aliyuncs.com/my-aiops/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: minio-change-me
+      OBJECT_STORE_BUCKET: zenith
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\" &&
+      mc mb --ignore-existing \"local/$$OBJECT_STORE_BUCKET\""
+    networks: [backend]
 
   app:
-    # 无源码时从镜像运行；可改 .env 中的 AIOPS_IMAGE 指向你的私有仓库
-    image: ${AIOPS_IMAGE:-ghcr.nju.edu.cn/fisker086/aiops:latest}
+    image: registry.cn-hangzhou.aliyuncs.com/my-aiops/zenith:latest
     restart: unless-stopped
-    # 若在本仓库内从 Dockerfile 构建，请改用下面三行并注释掉上面的 image：
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
-    env_file:
-      - path: .env
-        required: false
+      redis:
+        condition: service_healthy
     ports:
-      - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
+      - "${APP_PORT:-8080}:8080"
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aiops}?sslmode=disable}
-      SERVER_PORT: ${SERVER_PORT:-8080}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-      LOG_FORMAT: ${LOG_FORMAT:-text}
-      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-use-openssl-rand-hex-32}
-      MODEL_TYPE: ${MODEL_TYPE:-openai}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      OPENAI_BY_AZURE: ${OPENAI_BY_AZURE:-false}
-      ARK_API_KEY: ${ARK_API_KEY:-}
-      ARK_MODEL: ${ARK_MODEL:-}
-      ARK_BASE_URL: ${ARK_BASE_URL:-}
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.openai.com/v1}
-      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1536}
-      MEMORY_PROVIDER: ${MEMORY_PROVIDER:-pgvector}
-      MEMORY_RETRIEVE_TOP_K: ${MEMORY_RETRIEVE_TOP_K:-8}
-      OPENVIKING_ENABLED: ${OPENVIKING_ENABLED:-false}
-      OPENVIKING_URL: ${OPENVIKING_URL:-http://openviking:1933}
-      OPENVIKING_API_KEY: ${OPENVIKING_API_KEY:-}
-      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
-      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
-      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
-      ADMIN_WHITELIST: ${ADMIN_WHITELIST:-}
-      ADMIN_DEFAULT_PASSWORD: ${ADMIN_DEFAULT_PASSWORD:-changeme}
-      DISABLE_LOGIN_CAPTCHA: ${DISABLE_LOGIN_CAPTCHA:-false}
+      # 容器内固定项。这里的默认值刻意写死：裸 compose 不应被仓库开发用 .env
+      # 里的 localhost 地址或 lark/litellm 模式带偏。要改配置请写配置卷里的
+      # /data/config/.env —— 应用以它为最终来源（首次启动自动生成密钥）。
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "8080"
       SKILLS_DIR: /app/skills
-      UPLOAD_DIR: ${UPLOAD_DIR:-/app/data/uploads}
+      UPLOAD_DIR: /data/uploads
+      AIOPS_ENV_FILE: /data/config/.env
+      # --- 密码模式默认项 ---
+      AUTH_TYPE: password
+      ADMIN_DEFAULT_PASSWORD: ""
+      ADMIN_WHITELIST: ""
+      JWT_SECRET_KEY: ""
+      VAULT_MASTER_KEY: ""
+      CORS_ALLOWED_ORIGINS: http://localhost:${APP_PORT:-8080},http://127.0.0.1:${APP_PORT:-8080}
+      MODEL_TYPE: openai
+      OPENAI_API_KEY: ""
+      OPENAI_MODEL: gpt-4o-mini
+      OPENAI_BASE_URL: https://api.openai.com/v1
+      KNOWLEDGE_PROVIDER: none
+      # --- 内置依赖接线（compose 内网地址）---
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/aiops?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      # 密码模式直连上游；SSO + 虚拟 Key 才需要 litellm profile 并改配置。
+      LLM_GATEWAY_TYPE: none
+      LLM_GATEWAY_BASE_URL: ""
+      LLM_GATEWAY_ADMIN_KEY: ""
+      LLM_GATEWAY_CF_ACCESS_CLIENT_ID: ""
+      LLM_GATEWAY_CF_ACCESS_CLIENT_SECRET: ""
+      LLM_GATEWAY_VIRTUAL_KEY_ENABLED: "false"
+      OBJECT_STORE_TYPE: aws
+      OBJECT_STORE_BUCKET: zenith
+      OBJECT_STORE_REGION: us-east-1
+      # 必须带 http:// 前缀：裸主机名会被 SDK 补成 https://，打到 MinIO 明文端口会失败。
+      OBJECT_STORE_ENDPOINT: http://minio:9000
+      OBJECT_STORE_ACCESS_KEY: admin
+      OBJECT_STORE_SECRET_KEY: minio-change-me
+      # 无 CubeSandbox 时走容器内 local 沙箱。
+      SANDBOX_TYPE: local
+      # 记忆默认走 PG（pg_trgm，无需向量服务）。
+      MEMORY_PROVIDER: postgres
     volumes:
-      # Mount repo skills so new SKILL.md dirs appear without rebuilding the image (dev / hot-add).
-      - ./skills:/app/skills:ro
-      # KB originals + chat uploads. Set UPLOAD_HOST_PATH in .env to bind-mount host disk; else named volume.
-      - ${UPLOAD_HOST_PATH:-app_uploads}:/app/data/uploads
-      # Docker socket for sandbox execution (required for SANDBOX_TYPE=docker)
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker/config:/data/config
+      # 聊天附件等本地落盘文件；设 UPLOAD_HOST_PATH 可改为宿主机目录（属主需允许 uid 10001 写）。
+      - ${UPLOAD_HOST_PATH:-app_uploads}:/data/uploads
+      # 可选：热挂载仓库 skills（改 SKILL.md 免重建镜像）；纯镜像部署时删掉这一行。
+      # - ./skills:/app/skills:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [backend]
+
+networks:
+  backend:
+    name: aiops-net
 
 volumes:
   aiops-pg:
+  redis-data:
+  minio-data:
   app_uploads:
-  openviking-data:
